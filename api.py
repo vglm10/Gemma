@@ -9,10 +9,10 @@ OLLAMA_BASE = "http://localhost:11434"
 MAX_TOOL_ROUNDS = 10
 
 
-def get_system_prompt():
+def get_system_prompt(project_context=None):
     username = os.environ.get("USER", "user")
     home = os.path.expanduser("~")
-    return (
+    prompt = (
         f"You are Gemma, a helpful AI assistant running locally on the user's computer.\n"
         f"System: macOS {platform.mac_ver()[0]}, User: {username}, Home: {home}\n"
         f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
@@ -22,6 +22,9 @@ def get_system_prompt():
         f"Always use absolute paths (expand ~ to {home}). "
         f"Be concise in your responses. Show relevant output from tools."
     )
+    if project_context:
+        prompt += f"\n\n{project_context}"
+    return prompt
 
 
 class OllamaChat:
@@ -65,7 +68,7 @@ class OllamaChat:
                 elif content_token:
                     yield ("content", content_token)
 
-    def stream_with_tools(self, messages, tool_defs, think_enabled=False):
+    def stream_with_tools(self, messages, tool_defs, think_enabled=False, project_context=None):
         """
         Streaming chat with tool calling support.
         Generator yielding (event_type, data) tuples.
@@ -73,7 +76,9 @@ class OllamaChat:
         """
         # Ensure system prompt is first message
         if not messages or messages[0].get("role") != "system":
-            messages.insert(0, {"role": "system", "content": get_system_prompt()})
+            messages.insert(0, {"role": "system", "content": get_system_prompt(project_context)})
+        elif project_context and "PROJECT FOLDER" not in messages[0].get("content", ""):
+            messages[0]["content"] = get_system_prompt(project_context)
 
         for _round in range(MAX_TOOL_ROUNDS):
             accumulated_tool_calls = []

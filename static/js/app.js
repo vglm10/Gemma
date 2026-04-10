@@ -1,4 +1,6 @@
 const state = {
+    chatId: null,
+    chatTitle: "",
     messages: [],
     isGenerating: false,
     thinkEnabled: false,
@@ -6,7 +8,12 @@ const state = {
     thinkingStartTime: null,
     currentThinkingText: "",
     currentContentText: "",
+    sidebarOpen: true,
 };
+
+function generateId() {
+    return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+}
 
 const $messages = document.getElementById("messages");
 const $welcome = document.getElementById("welcome");
@@ -18,6 +25,12 @@ const $statusText = document.getElementById("status-text");
 const $schedulePanel = document.getElementById("schedule-panel");
 const $scheduleBtn = document.getElementById("schedule-btn");
 const $scheduleList = document.getElementById("schedule-list");
+const $sidebar = document.getElementById("sidebar");
+const $historyList = document.getElementById("history-list");
+const $newChatBtn = document.getElementById("new-chat-btn");
+const $sidebarToggle = document.getElementById("sidebar-toggle");
+const $projectBtn = document.getElementById("project-btn");
+const $projectLabel = document.getElementById("project-label");
 
 let currentAssistantEl = null;
 let currentContentEl = null;
@@ -64,6 +77,37 @@ document.getElementById("schedule-close").addEventListener("click", () => {
     $schedulePanel.classList.remove("open");
 });
 
+$newChatBtn.addEventListener("click", () => newChat());
+
+$sidebarToggle.addEventListener("click", () => {
+    state.sidebarOpen = !state.sidebarOpen;
+    $sidebar.classList.toggle("collapsed", !state.sidebarOpen);
+});
+
+$projectBtn.addEventListener("click", () => {
+    if ($projectBtn.classList.contains("active")) {
+        // Clear project
+        window.pywebview.api.clear_project_folder().then(() => {
+            $projectBtn.classList.remove("active");
+            $projectLabel.textContent = "Project";
+            $projectBtn.title = "Set project folder";
+            showToast("Project folder cleared");
+        });
+    } else {
+        // Pick folder
+        window.pywebview.api.pick_project_folder().then((raw) => {
+            const result = JSON.parse(raw);
+            if (result.path) {
+                const name = result.path.split("/").pop();
+                $projectBtn.classList.add("active");
+                $projectLabel.textContent = name;
+                $projectBtn.title = result.path + " (click to clear)";
+                showToast("Project set: " + name);
+            }
+        });
+    }
+});
+
 // Auto-scroll detection
 $messages.addEventListener("scroll", () => {
     const { scrollTop, scrollHeight, clientHeight } = $messages;
@@ -89,6 +133,12 @@ function sendMessage() {
 
     // Hide welcome
     if ($welcome) $welcome.style.display = "none";
+
+    // Create chat ID on first message
+    if (!state.chatId) {
+        state.chatId = generateId();
+        state.chatTitle = text.slice(0, 60);
+    }
 
     // Add user message
     state.messages.push({ role: "user", content: text });
@@ -336,7 +386,9 @@ window.onStreamEnd = function () {
         : null;
     if (cursor) cursor.remove();
 
-    // If there was content, it's already in state.messages via onMessagesSync
+    // Auto-save conversation
+    saveCurrentChat();
+
     finishGeneration();
 };
 
@@ -458,6 +510,178 @@ function showToast(message) {
     }, 3000);
 }
 
+// --- Chat history ---
+
+function saveCurrentChat() {
+    if (!state.chatId || state.messages.length === 0) return;
+    window.pywebview.api.save_chat(
+        state.chatId,
+        state.chatTitle,
+        JSON.stringify(state.messages)
+    ).then(() => refreshHistory());
+}
+
+function newChat() {
+    if (state.isGenerating) return;
+    state.chatId = null;
+    state.chatTitle = "";
+    state.messages = [];
+    state.currentThinkingText = "";
+    state.currentContentText = "";
+
+    // Clear message area and show welcome
+    $messages.innerHTML = "";
+    const welcome = document.createElement("div");
+    welcome.id = "welcome";
+    welcome.className = "welcome";
+    welcome.innerHTML = `
+        <div class="welcome-icon">G</div>
+        <h2>Gemma 4</h2>
+        <p>Running locally via Ollama</p>
+        <div class="welcome-capabilities">
+            <span>Run commands</span>
+            <span>Read & write files</span>
+            <span>Create documents</span>
+            <span>Schedule tasks</span>
+        </div>
+    `;
+    $messages.appendChild(welcome);
+
+    $input.value = "";
+    $input.focus();
+    $sendBtn.disabled = true;
+
+    // Deselect in sidebar
+    document.querySelectorAll(".history-item.active").forEach((el) => {
+        el.classList.remove("active");
+    });
+}
+
+function loadChat(chatId) {
+    if (state.isGenerating) return;
+    window.pywebview.api.load_chat(chatId).then((raw) => {
+        const data = JSON.parse(raw);
+        if (!data.id) return;
+
+        state.chatId = data.id;
+        state.chatTitle = data.title || "Untitled";
+        state.messages = data.messages || [];
+
+        // Re-render all messages
+        $messages.innerHTML = "";
+        let assistantContent = "";
+
+        for (const msg of state.messages) {
+            if (msg.role === "user") {
+                appendUserMessage(msg.content);
+            } else if (msg.role === "assistant") {
+                const el = document.createElement("div");
+                el.className = "message message-assistant";
+
+                const label = document.createElement("div");
+                label.className = "message-label";
+                label.textContent = "Gemma";
+
+                const content = document.createElement("div");
+                content.className = "message-content";
+                content.innerHTML = marked.parse(msg.content || "");
+
+                el.appendChild(label);
+
+                // Show tool calls if present
+                if (msg.tool_calls) {
+                    for (const tc of msg.tool_calls) {
+                        const func = tc.function || {};
+                        const block = document.createElement("div");
+                        block.className = "tool-block";
+                        block.innerHTML = `
+                            <div class="tool-header">
+                                <span class="tool-icon">${escapeHtml(getToolIcon(func.name))}</span>
+                                <span class="tool-name">${escapeHtml(func.name || "")}</span>
+                                <span class="tool-args">${escapeHtml(formatToolArgs(func.name, func.arguments || {}))}</span>
+                                <span class="tool-done"> done</span>
+                            </div>
+                        `;
+                        el.appendChild(block);
+                    }
+                }
+
+                el.appendChild(content);
+                $messages.appendChild(el);
+            }
+            // Skip "tool" and "system" role messages in rendering
+        }
+
+        scrollToBottom();
+
+        // Highlight in sidebar
+        document.querySelectorAll(".history-item.active").forEach((el) => {
+            el.classList.remove("active");
+        });
+        const active = document.querySelector(`.history-item[data-id="${chatId}"]`);
+        if (active) active.classList.add("active");
+    });
+}
+
+function refreshHistory() {
+    window.pywebview.api.list_chats().then((raw) => {
+        const chats = JSON.parse(raw);
+        $historyList.innerHTML = "";
+        if (chats.length === 0) {
+            $historyList.innerHTML =
+                '<div class="history-empty">No conversations yet</div>';
+            return;
+        }
+        chats.forEach((c) => {
+            const item = document.createElement("div");
+            item.className = "history-item" + (c.id === state.chatId ? " active" : "");
+            item.dataset.id = c.id;
+
+            const title = document.createElement("div");
+            title.className = "history-item-title";
+            title.textContent = c.title || "Untitled";
+
+            const date = document.createElement("div");
+            date.className = "history-item-date";
+            date.textContent = formatDate(c.updated);
+
+            const del = document.createElement("button");
+            del.className = "history-item-delete";
+            del.innerHTML = "&times;";
+            del.title = "Delete";
+            del.addEventListener("click", (e) => {
+                e.stopPropagation();
+                window.pywebview.api.delete_chat(c.id).then(() => {
+                    if (state.chatId === c.id) newChat();
+                    refreshHistory();
+                });
+            });
+
+            item.appendChild(title);
+            item.appendChild(date);
+            item.appendChild(del);
+
+            item.addEventListener("click", () => loadChat(c.id));
+            $historyList.appendChild(item);
+        });
+    });
+}
+
+function formatDate(ts) {
+    if (!ts) return "";
+    const d = new Date(ts * 1000);
+    const now = new Date();
+    if (d.toDateString() === now.toDateString()) {
+        return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    }
+    const yesterday = new Date(now);
+    yesterday.setDate(yesterday.getDate() - 1);
+    if (d.toDateString() === yesterday.toDateString()) {
+        return "Yesterday";
+    }
+    return d.toLocaleDateString([], { month: "short", day: "numeric" });
+}
+
 // --- Init ---
 
 window.addEventListener("pywebviewready", () => {
@@ -468,6 +692,7 @@ window.addEventListener("pywebviewready", () => {
             $statusText.style.color = "#e54d4d";
         }
     });
+    refreshHistory();
 });
 
 $sendBtn.disabled = true;
