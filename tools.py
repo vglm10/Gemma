@@ -1,6 +1,5 @@
 import subprocess
 import os
-import json
 import glob as glob_module
 from datetime import datetime
 
@@ -99,36 +98,6 @@ TOOL_DEFINITIONS = [
     {
         "type": "function",
         "function": {
-            "name": "create_document",
-            "description": "Create a PDF or Excel document. For PDF, provide title and text content. For Excel, provide headers and rows of data.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "format": {
-                        "type": "string",
-                        "enum": ["pdf", "excel"],
-                        "description": "Document format: 'pdf' or 'excel'",
-                    },
-                    "path": {
-                        "type": "string",
-                        "description": "Absolute path where the document will be saved",
-                    },
-                    "title": {
-                        "type": "string",
-                        "description": "Document title",
-                    },
-                    "content": {
-                        "type": "string",
-                        "description": "For PDF: the text content. For Excel: JSON string with 'headers' (list) and 'rows' (list of lists).",
-                    },
-                },
-                "required": ["format", "path", "title", "content"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
             "name": "manage_schedule",
             "description": "Manage scheduled tasks. Actions: 'create' (set up a recurring task), 'list' (show all tasks), 'delete' (remove a task by id).",
             "parameters": {
@@ -162,13 +131,25 @@ TOOL_DEFINITIONS = [
     },
 ]
 
-# Scheduler reference — set by main.py at startup
+# References — set by main.py at startup
 _scheduler = None
+_mcp_manager = None
+_skills_manager = None
 
 
 def set_scheduler(scheduler):
     global _scheduler
     _scheduler = scheduler
+
+
+def set_mcp_manager(mcp_manager):
+    global _mcp_manager
+    _mcp_manager = mcp_manager
+
+
+def set_skills_manager(skills_manager):
+    global _skills_manager
+    _skills_manager = skills_manager
 
 
 def _truncate(text):
@@ -179,6 +160,17 @@ def _truncate(text):
 
 def execute_tool(name, args):
     """Execute a tool by name with given args. Returns result string."""
+    # Skill tools first (cheap prefix match)
+    if _skills_manager and _skills_manager.is_skill_tool(name):
+        return _truncate(_skills_manager.execute_tool(name, args))
+
+    # MCP tools
+    if _mcp_manager and _mcp_manager.is_mcp_tool(name):
+        try:
+            return _truncate(_mcp_manager.call_tool(name, args))
+        except Exception as e:
+            return f"MCP Error: {e}"
+
     try:
         if name == "run_command":
             return _run_command(args.get("command", ""))
@@ -190,13 +182,6 @@ def execute_tool(name, args):
             return _list_directory(args.get("path", ""))
         elif name == "search_files":
             return _search_files(args.get("pattern", ""))
-        elif name == "create_document":
-            return _create_document(
-                args.get("format", "pdf"),
-                args.get("path", ""),
-                args.get("title", ""),
-                args.get("content", ""),
-            )
         elif name == "manage_schedule":
             return _manage_schedule(args)
         else:
@@ -266,7 +251,6 @@ def _list_directory(path):
         try:
             stat = os.stat(full)
             is_dir = os.path.isdir(full)
-            size = stat.st_size if not is_dir else "-"
             mtime = datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M")
             prefix = "d" if is_dir else "f"
             size_str = _human_size(stat.st_size) if not is_dir else "   -"
@@ -296,63 +280,6 @@ def _search_files(pattern):
     result = f"Found {len(matches)} file(s):\n"
     result += "\n".join(f"  {m}" for m in matches)
     return result
-
-
-def _create_document(fmt, path, title, content):
-    path = os.path.expanduser(path)
-    directory = os.path.dirname(path)
-    if directory and not os.path.exists(directory):
-        os.makedirs(directory, exist_ok=True)
-
-    if fmt == "pdf":
-        return _create_pdf(path, title, content)
-    elif fmt == "excel":
-        return _create_excel(path, title, content)
-    else:
-        return f"Error: Unknown format '{fmt}'. Use 'pdf' or 'excel'."
-
-
-def _create_pdf(path, title, content):
-    from fpdf import FPDF
-
-    pdf = FPDF()
-    pdf.set_auto_page_break(auto=True, margin=15)
-    pdf.add_page()
-    pdf.set_font("Helvetica", "B", 18)
-    pdf.cell(0, 12, title, ln=True, align="C")
-    pdf.ln(6)
-    pdf.set_font("Helvetica", "", 11)
-    for line in content.split("\n"):
-        pdf.multi_cell(0, 6, line)
-    pdf.output(path)
-    return f"PDF created: {path}"
-
-
-def _create_excel(path, title, content):
-    from openpyxl import Workbook
-    from openpyxl.styles import Font
-
-    try:
-        data = json.loads(content)
-    except json.JSONDecodeError:
-        return "Error: Excel content must be a JSON string with 'headers' and 'rows'"
-
-    headers = data.get("headers", [])
-    rows = data.get("rows", [])
-
-    wb = Workbook()
-    ws = wb.active
-    ws.title = title[:31]
-
-    if headers:
-        ws.append(headers)
-        for cell in ws[1]:
-            cell.font = Font(bold=True)
-    for row in rows:
-        ws.append(row)
-
-    wb.save(path)
-    return f"Excel file created: {path} ({len(rows)} rows)"
 
 
 def _manage_schedule(args):

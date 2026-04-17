@@ -9,7 +9,7 @@ OLLAMA_BASE = "http://localhost:11434"
 MAX_TOOL_ROUNDS = 10
 
 
-def get_system_prompt(project_context=None):
+def get_system_prompt(project_context=None, skills_index=None):
     username = os.environ.get("USER", "user")
     home = os.path.expanduser("~")
     prompt = (
@@ -17,13 +17,15 @@ def get_system_prompt(project_context=None):
         f"System: macOS {platform.mac_ver()[0]}, User: {username}, Home: {home}\n"
         f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
         f"You have access to tools that let you run shell commands, read/write files, "
-        f"list directories, search files, create documents (PDF/Excel), and manage scheduled tasks.\n"
+        f"list directories, search files, and manage scheduled tasks.\n"
         f"Use tools when the user asks you to interact with their system. "
         f"Always use absolute paths (expand ~ to {home}). "
         f"Be concise in your responses. Show relevant output from tools."
     )
     if project_context:
         prompt += f"\n\n{project_context}"
+    if skills_index:
+        prompt += f"\n\n{skills_index}"
     return prompt
 
 
@@ -68,27 +70,41 @@ class OllamaChat:
                 elif content_token:
                     yield ("content", content_token)
 
-    def stream_with_tools(self, messages, tool_defs, think_enabled=False, project_context=None):
+    def stream_with_tools(self, messages, tool_defs, think_enabled=False,
+                          project_context=None, skills_index=None,
+                          build_tool_defs=None, skill_activation_cb=None):
         """
         Streaming chat with tool calling support.
+
+        build_tool_defs: optional callable() -> list[dict]. If provided, it is
+        called before each round to re-compute the tool list (used by the
+        skills layer so newly-activated skill tools appear next turn).
+        skill_activation_cb: optional callable(tool_name, tool_args, tool_result)
+        invoked after each tool call so the caller can detect skill activation.
+
         Generator yielding (event_type, data) tuples.
         Event types: "thinking", "content", "tool_call", "tool_result"
         """
         # Ensure system prompt is first message
+        sys_prompt = get_system_prompt(project_context, skills_index)
         if not messages or messages[0].get("role") != "system":
-            messages.insert(0, {"role": "system", "content": get_system_prompt(project_context)})
-        elif project_context and "PROJECT FOLDER" not in messages[0].get("content", ""):
-            messages[0]["content"] = get_system_prompt(project_context)
+            messages.insert(0, {"role": "system", "content": sys_prompt})
+        else:
+            # Always refresh — project context or active skills may have changed.
+            messages[0]["content"] = sys_prompt
 
         for _round in range(MAX_TOOL_ROUNDS):
             accumulated_tool_calls = []
             accumulated_content = ""
             accumulated_thinking = ""
 
+            # Re-compute tool defs each round so freshly-activated skills appear.
+            current_tool_defs = build_tool_defs() if build_tool_defs else tool_defs
+
             payload = {
                 "model": "gemma4:e4b",
                 "messages": messages,
-                "tools": tool_defs,
+                "tools": current_tool_defs,
                 "stream": True,
             }
             if think_enabled:
@@ -154,6 +170,12 @@ class OllamaChat:
                 result = execute_tool(name, args)
 
                 yield ("tool_result", {"name": name, "result": result})
+
+                if skill_activation_cb:
+                    try:
+                        skill_activation_cb(name, args, result)
+                    except Exception:
+                        pass
 
                 messages.append({"role": "tool", "content": str(result)})
 

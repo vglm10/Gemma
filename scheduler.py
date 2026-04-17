@@ -6,7 +6,7 @@ import threading
 import httpx
 
 OLLAMA_BASE = "http://localhost:11434"
-DATA_DIR = os.path.expanduser("~/.gemma-chat")
+DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 SCHEDULES_FILE = os.path.join(DATA_DIR, "schedules.json")
 
 

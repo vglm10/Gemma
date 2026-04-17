@@ -3,12 +3,15 @@ import threading
 import json
 import os
 import time
-import uuid
 from api import OllamaChat
-from tools import TOOL_DEFINITIONS, set_scheduler
+from tools import TOOL_DEFINITIONS, set_scheduler, set_mcp_manager, set_skills_manager
 from scheduler import Scheduler
+from mcp_manager import MCPManager, load_config, save_config
+from pml import PMLManager
+from skills_manager import SkillsManager
 
-HISTORY_DIR = os.path.expanduser("~/.gemma-chat/history")
+DATA_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+HISTORY_DIR = os.path.join(DATA_ROOT, "history")
 
 
 IGNORE_DIRS = {
@@ -105,6 +108,12 @@ class Api:
         self._scheduler = None
         self._project_folder = None
         self._project_context = None
+        self._mcp = MCPManager()
+        self._pml = PMLManager()
+        self._skills = SkillsManager()
+        # per-chat set of skill names activated this session
+        self._active_skills: dict[str, set] = {}
+        self._current_chat_id: str = ""
 
     def set_window(self, window):
         self._window = window
@@ -113,6 +122,26 @@ class Api:
         self._scheduler = Scheduler(on_result=self._on_schedule_result)
         set_scheduler(self._scheduler)
         self._scheduler.start()
+
+    def init_skills(self):
+        self._skills.load()
+        self._skills.set_context(
+            api=self,
+            pml=self._pml,
+            scheduler=self._scheduler,
+            mcp=self._mcp,
+            window=self._window,
+        )
+        set_skills_manager(self._skills)
+
+    def init_mcp(self):
+        """Start MCP event loop and connect to configured servers."""
+        self._mcp.start()
+        set_mcp_manager(self._mcp)
+        try:
+            self._mcp.connect_all()
+        except Exception:
+            pass
 
     def _on_schedule_result(self, task, result):
         """Called by scheduler when a task completes."""
@@ -123,23 +152,51 @@ class Api:
     def check_health(self):
         return self.ollama.check_health()
 
-    def send_message(self, messages_json, think_enabled):
+    def send_message(self, messages_json, think_enabled, chat_id=""):
         """Called from JS. Starts streaming with tools in a background thread."""
         self._cancel = False
+        self._current_chat_id = chat_id or ""
+        # Seed per-chat active_skills with pinned skills if this chat is new.
+        if self._current_chat_id and self._current_chat_id not in self._active_skills:
+            self._active_skills[self._current_chat_id] = set(self._skills.pinned_names())
         messages = json.loads(messages_json)
         thread = threading.Thread(
             target=self._stream_response,
-            args=(messages, think_enabled),
+            args=(messages, think_enabled, self._current_chat_id),
             daemon=True,
         )
         thread.start()
         return True
 
-    def _stream_response(self, messages, think_enabled):
+    def _stream_response(self, messages, think_enabled, chat_id):
         try:
+            def _active_set():
+                return self._active_skills.get(chat_id, set())
+
+            def _build_tool_defs():
+                return (
+                    TOOL_DEFINITIONS
+                    + self._mcp.get_ollama_tools()
+                    + self._skills.tool_defs_for_active(_active_set())
+                )
+
+            def _on_tool_call(name, args, result):
+                if name != "read_file":
+                    return
+                path = (args or {}).get("path", "")
+                skill = self._skills.skill_for_path(path)
+                if skill:
+                    self._active_skills.setdefault(chat_id, set()).add(skill)
+
+            skills_index = self._skills.get_index(_active_set())
+            initial_tools = _build_tool_defs()
+
             for event_type, data in self.ollama.stream_with_tools(
-                messages, TOOL_DEFINITIONS, think_enabled,
+                messages, initial_tools, think_enabled,
                 project_context=self._project_context,
+                skills_index=skills_index,
+                build_tool_defs=_build_tool_defs,
+                skill_activation_cb=_on_tool_call,
             ):
                 if self._cancel:
                     break
@@ -171,6 +228,54 @@ class Api:
 
     def stop_generation(self):
         self._cancel = True
+
+    # --- File upload (called from JS) ---
+
+    def pick_file(self):
+        """Open native file picker and return file info + content."""
+        result = self._window.create_file_dialog(
+            webview.OPEN_DIALOG,
+            directory=os.path.expanduser("~"),
+            allow_multiple=False,
+            file_types=(
+                "All files (*.*)",
+                "Text files (*.txt;*.md;*.csv;*.json;*.xml;*.yaml;*.yml;*.log;*.py;*.js;*.html;*.css)",
+                "Documents (*.pdf;*.doc;*.docx)",
+            ),
+        )
+        if not result or len(result) == 0:
+            return json.dumps({"ok": False})
+
+        path = result[0]
+        name = os.path.basename(path)
+        size = os.path.getsize(path)
+        ext = os.path.splitext(name)[1].lower()
+
+        # Size limit: 500KB
+        if size > 500_000:
+            return json.dumps({"ok": False, "error": f"File too large ({size} bytes, max 500KB)"})
+
+        try:
+            if ext == ".pdf":
+                content = self._read_pdf(path)
+            else:
+                with open(path, "r", errors="replace") as f:
+                    content = f.read()
+
+            return json.dumps({
+                "ok": True,
+                "name": name,
+                "path": path,
+                "size": size,
+                "content": content[:50000],  # cap at 50K chars
+            })
+        except Exception as e:
+            return json.dumps({"ok": False, "error": str(e)})
+
+    def _read_pdf(self, path):
+        """Extract text from a PDF using pymupdf4llm — outputs clean Markdown."""
+        import pymupdf4llm
+        return pymupdf4llm.to_markdown(path)
 
     # --- Project folder (called from JS) ---
 
@@ -227,6 +332,7 @@ class Api:
             "created": created,
             "updated": time.time(),
             "messages": messages,
+            "active_skills": sorted(self._active_skills.get(chat_id, set())),
         }
         with open(path, "w") as f:
             json.dump(data, f)
@@ -238,7 +344,14 @@ class Api:
         if not os.path.exists(path):
             return "{}"
         with open(path, "r") as f:
-            return f.read()
+            raw = f.read()
+        try:
+            data = json.loads(raw)
+            skills = data.get("active_skills") or []
+            self._active_skills[chat_id] = set(skills)
+        except (json.JSONDecodeError, TypeError):
+            pass
+        return raw
 
     def list_chats(self):
         """List all saved conversations, most recent first."""
@@ -268,6 +381,136 @@ class Api:
             os.remove(path)
             return True
         return False
+
+    # --- Skills panel (called from JS) ---
+
+    def get_skills_status(self):
+        status = self._skills.list_status()
+        # Augment with connector auth state for oauth skills.
+        for s in status:
+            if s.get("auth_kind") == "oauth" and s["name"] == "gmail":
+                from connectors import gmail as gmail_connector
+                gc = gmail_connector.get()
+                s["auth"] = {
+                    "configured": gc.is_configured(),
+                    "authed": gc.is_authed(),
+                    "email": gc.user_email() if gc.is_authed() else "",
+                }
+        return json.dumps(status)
+
+    def toggle_skill(self, name, enabled):
+        ok = self._skills.set_enabled(name, bool(enabled))
+        return json.dumps({"ok": ok})
+
+    def toggle_skill_pin(self, name, pinned):
+        ok = self._skills.set_pinned(name, bool(pinned))
+        return json.dumps({"ok": ok})
+
+    def rescan_skills(self):
+        self._skills.load()
+        self._skills.set_context(
+            api=self, pml=self._pml, scheduler=self._scheduler,
+            mcp=self._mcp, window=self._window,
+        )
+        return self.get_skills_status()
+
+    # --- Gmail OAuth (called from JS) ---
+
+    def gmail_connect(self):
+        """Kick off OAuth in a background thread. JS gets notified via
+        window.onGmailAuthResult(raw_json) when it finishes."""
+        from connectors import gmail as gmail_connector
+
+        def _run():
+            conn = gmail_connector.get()
+            result = conn.start_auth()
+            if self._window:
+                payload = json.dumps(result)
+                self._window.evaluate_js(f"window.onGmailAuthResult({payload})")
+
+        threading.Thread(target=_run, daemon=True).start()
+        return True
+
+    def gmail_disconnect(self):
+        from connectors import gmail as gmail_connector
+        ok = gmail_connector.get().revoke()
+        return json.dumps({"ok": ok})
+
+    # --- PML dashboard (called from JS) ---
+
+    def pml_get_patients(self):
+        return json.dumps(self._pml.list_patients())
+
+    def pml_get_patient_scripts(self, patient_id):
+        return json.dumps(self._pml.get_scripts_for_status(patient_id))
+
+    def pml_get_script_text(self, patient_id, script_name):
+        return self._pml.get_script(patient_id, script_name)
+
+    def pml_advance_patient(self, patient_id):
+        p = self._pml.advance_status(patient_id)
+        return json.dumps(p) if p else "{}"
+
+    def pml_delete_patient(self, patient_id):
+        return self._pml.delete_patient(patient_id)
+
+    def pml_add_patient(self, name, clinician, weeks, has_therapist,
+                        therapist_name, therapist_contact):
+        p = self._pml.create_patient(
+            name, clinician, int(weeks), has_therapist,
+            therapist_name, therapist_contact,
+        )
+        return json.dumps(p)
+
+    def pml_get_checklist(self, patient_id):
+        return json.dumps(self._pml.get_checklist(patient_id))
+
+    def pml_get_pipeline(self):
+        return json.dumps(self._pml.get_pipeline_summary())
+
+    # --- MCP management (called from JS) ---
+
+    def get_mcp_status(self):
+        """Get status of all MCP servers."""
+        return json.dumps(self._mcp.get_status())
+
+    def get_mcp_config(self):
+        """Get the MCP config."""
+        return json.dumps(load_config())
+
+    def add_mcp_server(self, name, command, args_json, env_json):
+        """Add an MCP server to config and connect."""
+        config = load_config()
+        args = json.loads(args_json) if args_json else []
+        env = json.loads(env_json) if env_json else {}
+        config["servers"][name] = {
+            "command": command,
+            "args": args,
+            "env": env,
+        }
+        save_config(config)
+        # Connect to the new server
+        try:
+            result = self._mcp.connect_all()
+            return json.dumps({"ok": True, "result": result})
+        except Exception as e:
+            return json.dumps({"ok": False, "error": str(e)})
+
+    def remove_mcp_server(self, name):
+        """Remove an MCP server from config."""
+        config = load_config()
+        if name in config.get("servers", {}):
+            del config["servers"][name]
+            save_config(config)
+        self._mcp.disconnect_all()
+        self._mcp.connect_all()
+        return True
+
+    def reconnect_mcp(self):
+        """Reconnect all MCP servers."""
+        self._mcp.disconnect_all()
+        result = self._mcp.connect_all()
+        return json.dumps(result)
 
     # --- Schedule management (called from JS) ---
 
@@ -304,4 +547,6 @@ if __name__ == "__main__":
     )
     api.set_window(window)
     api.init_scheduler()
+    api.init_skills()
+    api.init_mcp()
     webview.start(debug=False)

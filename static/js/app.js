@@ -9,6 +9,7 @@ const state = {
     currentThinkingText: "",
     currentContentText: "",
     sidebarOpen: true,
+    attachment: null,
 };
 
 function generateId() {
@@ -29,8 +30,16 @@ const $sidebar = document.getElementById("sidebar");
 const $historyList = document.getElementById("history-list");
 const $newChatBtn = document.getElementById("new-chat-btn");
 const $sidebarToggle = document.getElementById("sidebar-toggle");
+const $uploadBtn = document.getElementById("upload-btn");
+const $attachmentPreview = document.getElementById("attachment-preview");
 const $projectBtn = document.getElementById("project-btn");
 const $projectLabel = document.getElementById("project-label");
+const $mcpBtn = document.getElementById("mcp-btn");
+const $mcpPanel = document.getElementById("mcp-panel");
+const $mcpServers = document.getElementById("mcp-servers");
+const $skillsBtn = document.getElementById("skills-btn");
+const $skillsPanel = document.getElementById("skills-panel");
+const $skillsList = document.getElementById("skills-list");
 
 let currentAssistantEl = null;
 let currentContentEl = null;
@@ -79,9 +88,86 @@ document.getElementById("schedule-close").addEventListener("click", () => {
 
 $newChatBtn.addEventListener("click", () => newChat());
 
+$uploadBtn.addEventListener("click", () => {
+    window.pywebview.api.pick_file().then((raw) => {
+        const result = JSON.parse(raw);
+        if (!result.ok) {
+            if (result.error) showToast(result.error);
+            return;
+        }
+        state.attachment = result;
+        $attachmentPreview.style.display = "flex";
+        $attachmentPreview.innerHTML = `
+            <span class="attachment-name">${escapeHtml(result.name)}</span>
+            <span class="attachment-size">${formatFileSize(result.size)}</span>
+            <button class="attachment-remove">&times;</button>
+        `;
+        $attachmentPreview.querySelector(".attachment-remove").addEventListener("click", () => {
+            state.attachment = null;
+            $attachmentPreview.style.display = "none";
+        });
+        $sendBtn.disabled = false;
+    });
+});
+
 $sidebarToggle.addEventListener("click", () => {
     state.sidebarOpen = !state.sidebarOpen;
     $sidebar.classList.toggle("collapsed", !state.sidebarOpen);
+});
+
+$mcpBtn.addEventListener("click", () => {
+    $mcpPanel.classList.toggle("open");
+    if ($mcpPanel.classList.contains("open")) {
+        refreshMCP();
+    }
+});
+
+$skillsBtn.addEventListener("click", () => {
+    $skillsPanel.classList.toggle("open");
+    if ($skillsPanel.classList.contains("open")) {
+        refreshSkills();
+    }
+});
+
+document.getElementById("skills-close").addEventListener("click", () => {
+    $skillsPanel.classList.remove("open");
+});
+
+document.getElementById("skills-rescan").addEventListener("click", () => {
+    window.pywebview.api.rescan_skills().then(() => {
+        refreshSkills();
+        showToast("Skills rescanned");
+    });
+});
+
+document.getElementById("mcp-close").addEventListener("click", () => {
+    $mcpPanel.classList.remove("open");
+});
+
+document.getElementById("mcp-add-btn").addEventListener("click", () => {
+    const name = document.getElementById("mcp-name").value.trim();
+    const command = document.getElementById("mcp-command").value.trim();
+    const args = document.getElementById("mcp-args").value.trim() || "[]";
+    const env = document.getElementById("mcp-env").value.trim() || "{}";
+    if (!name || !command) {
+        showToast("Name and command are required");
+        return;
+    }
+    document.getElementById("mcp-add-btn").textContent = "Connecting...";
+    window.pywebview.api.add_mcp_server(name, command, args, env).then((raw) => {
+        const result = JSON.parse(raw);
+        if (result.ok) {
+            showToast("Server added and connected");
+            document.getElementById("mcp-name").value = "";
+            document.getElementById("mcp-command").value = "";
+            document.getElementById("mcp-args").value = "";
+            document.getElementById("mcp-env").value = "";
+        } else {
+            showToast("Error: " + (result.error || "Failed to connect"));
+        }
+        document.getElementById("mcp-add-btn").textContent = "Add & Connect";
+        refreshMCP();
+    });
 });
 
 $projectBtn.addEventListener("click", () => {
@@ -129,7 +215,7 @@ function scrollToBottom() {
 
 function sendMessage() {
     const text = $input.value.trim();
-    if (!text || state.isGenerating) return;
+    if ((!text && !state.attachment) || state.isGenerating) return;
 
     // Hide welcome
     if ($welcome) $welcome.style.display = "none";
@@ -137,12 +223,25 @@ function sendMessage() {
     // Create chat ID on first message
     if (!state.chatId) {
         state.chatId = generateId();
-        state.chatTitle = text.slice(0, 60);
+        state.chatTitle = (text || state.attachment?.name || "").slice(0, 60);
+    }
+
+    // Build message content — include attachment if present
+    let content = text;
+    if (state.attachment) {
+        const fileHeader = `[Attached file: ${state.attachment.name}]\n\n`;
+        content = text
+            ? `${text}\n\n${fileHeader}${state.attachment.content}`
+            : `${fileHeader}${state.attachment.content}`;
     }
 
     // Add user message
-    state.messages.push({ role: "user", content: text });
-    appendUserMessage(text);
+    state.messages.push({ role: "user", content: content });
+    appendUserMessage(text, state.attachment);
+
+    // Clear attachment
+    state.attachment = null;
+    $attachmentPreview.style.display = "none";
 
     // Clear input
     $input.value = "";
@@ -169,7 +268,7 @@ function sendMessage() {
         return msg;
     });
     window.pywebview.api
-        .send_message(JSON.stringify(messagesForApi), state.thinkEnabled)
+        .send_message(JSON.stringify(messagesForApi), state.thinkEnabled, state.chatId || "")
         .catch((err) => {
             window.onStreamError(err.toString());
         });
@@ -179,15 +278,29 @@ function stopGeneration() {
     window.pywebview.api.stop_generation();
 }
 
-function appendUserMessage(text) {
+function appendUserMessage(text, attachment) {
     const el = document.createElement("div");
     el.className = "message message-user";
-    el.innerHTML = `
-        <div class="message-label">You</div>
-        <div class="message-content">${escapeHtml(text)}</div>
-    `;
+    let html = '<div class="message-label">You</div>';
+    if (attachment) {
+        html += `<div class="message-attachment">
+            <span class="attachment-icon">F</span>
+            <span>${escapeHtml(attachment.name)}</span>
+            <span class="attachment-size">${formatFileSize(attachment.size)}</span>
+        </div>`;
+    }
+    if (text) {
+        html += `<div class="message-content">${escapeHtml(text)}</div>`;
+    }
+    el.innerHTML = html;
     $messages.appendChild(el);
     scrollToBottom();
+}
+
+function formatFileSize(bytes) {
+    if (bytes < 1024) return bytes + " B";
+    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + " KB";
+    return (bytes / (1024 * 1024)).toFixed(1) + " MB";
 }
 
 function createAssistantPlaceholder() {
@@ -509,6 +622,467 @@ function showToast(message) {
         setTimeout(() => toast.remove(), 300);
     }, 3000);
 }
+
+// --- PML Dashboard ---
+
+const $pmlPanel = document.getElementById("pml-panel");
+const $pmlBtn = document.getElementById("pml-btn");
+const $pmlPatients = document.getElementById("pml-patients");
+const $pmlPipeline = document.getElementById("pml-pipeline");
+const $pmlAddForm = document.getElementById("pml-add-form");
+const $pmlAddBtn = document.getElementById("pml-add-btn");
+
+$pmlBtn.addEventListener("click", () => {
+    $pmlPanel.classList.toggle("open");
+    if ($pmlPanel.classList.contains("open")) refreshPML();
+});
+
+document.getElementById("pml-close").addEventListener("click", () => {
+    $pmlPanel.classList.remove("open");
+});
+
+$pmlAddBtn.addEventListener("click", () => {
+    $pmlAddForm.style.display = "block";
+    $pmlAddBtn.style.display = "none";
+});
+
+document.getElementById("pml-add-cancel").addEventListener("click", () => {
+    $pmlAddForm.style.display = "none";
+    $pmlAddBtn.style.display = "block";
+});
+
+document.getElementById("pml-f-has-therapist").addEventListener("change", (e) => {
+    document.getElementById("pml-therapist-fields").style.display = e.target.checked ? "block" : "none";
+});
+
+document.getElementById("pml-add-submit").addEventListener("click", () => {
+    const name = document.getElementById("pml-f-name").value.trim();
+    if (!name) { showToast("Patient name required"); return; }
+    const clinician = document.getElementById("pml-f-clinician").value.trim() || "Dr. Al-Katib";
+    const weeks = document.getElementById("pml-f-weeks").value || "4";
+    const hasTherapist = document.getElementById("pml-f-has-therapist").checked;
+    const therapistName = document.getElementById("pml-f-therapist-name")?.value.trim() || "";
+    const therapistContact = document.getElementById("pml-f-therapist-contact")?.value.trim() || "";
+
+    window.pywebview.api.pml_add_patient(name, clinician, weeks, hasTherapist, therapistName, therapistContact)
+        .then(() => {
+            showToast(`PML track created for ${name}`);
+            $pmlAddForm.style.display = "none";
+            $pmlAddBtn.style.display = "block";
+            document.getElementById("pml-f-name").value = "";
+            document.getElementById("pml-f-has-therapist").checked = false;
+            document.getElementById("pml-therapist-fields").style.display = "none";
+            refreshPML();
+        });
+});
+
+function refreshPML() {
+    // Pipeline summary
+    window.pywebview.api.pml_get_pipeline().then((raw) => {
+        const pipeline = JSON.parse(raw);
+        const labels = {
+            initiated: "New", patient_contacted: "Contacted", awaiting_therapist_info: "Info",
+            roi_sent: "ROI Sent", therapy_referral: "Referral", roi_verified: "Verified",
+            visit2_ready: "Visit 2", forms_completed: "Done", active_monitoring: "Active",
+        };
+        const pills = Object.entries(pipeline).map(([s, c]) =>
+            `<span class="pml-pipeline-pill">${labels[s] || s}: ${c}</span>`
+        ).join("");
+        $pmlPipeline.innerHTML = pills || '<span class="pml-pipeline-empty">No patients yet</span>';
+    });
+
+    // Patient list
+    window.pywebview.api.pml_get_patients().then((raw) => {
+        const patients = JSON.parse(raw);
+        $pmlPatients.innerHTML = "";
+        if (patients.length === 0) {
+            $pmlPatients.innerHTML = '<div class="schedule-empty">No PML patients. Click below to add one.</div>';
+            return;
+        }
+        const statusLabels = {
+            initiated: "Initiated", patient_contacted: "Contacted",
+            awaiting_therapist_info: "Awaiting Info", roi_sent: "ROI Sent",
+            therapy_referral: "Needs Referral", roi_verified: "ROI Verified",
+            visit2_ready: "Ready for Visit 2", forms_completed: "Forms Done",
+            active_monitoring: "Active",
+        };
+        const statusColors = {
+            initiated: "#7c6bf5", patient_contacted: "#4a9eff", awaiting_therapist_info: "#d4a843",
+            roi_sent: "#d4a843", therapy_referral: "#e54d4d", roi_verified: "#4ade80",
+            visit2_ready: "#4ade80", forms_completed: "#4ade80", active_monitoring: "#888",
+        };
+        patients.forEach((p) => {
+            const card = document.createElement("div");
+            card.className = "pml-patient-card";
+            const color = statusColors[p.status] || "#888";
+            const roiInfo = p.roi_sent_date && !p.roi_returned
+                ? `<div class="pml-roi-warning">ROI sent ${p.roi_sent_date}</div>` : "";
+            card.innerHTML = `
+                <div class="pml-card-header">
+                    <div class="pml-card-name">${escapeHtml(p.name)}</div>
+                    <button class="pml-card-delete" title="Remove">&times;</button>
+                </div>
+                <div class="pml-card-meta">${escapeHtml(p.clinician)} &middot; ${p.weeks} weeks</div>
+                <div class="pml-card-status" style="color:${color}">${statusLabels[p.status] || p.status}</div>
+                ${roiInfo}
+                <div class="pml-card-actions">
+                    <button class="pml-scripts-btn">Scripts</button>
+                    <button class="pml-advance-btn">Next Step</button>
+                </div>
+                <div class="pml-scripts-dropdown" style="display:none"></div>
+            `;
+
+            card.querySelector(".pml-card-delete").addEventListener("click", () => {
+                window.pywebview.api.pml_delete_patient(p.id).then(() => {
+                    refreshPML();
+                    showToast(`${p.name} removed`);
+                });
+            });
+
+            card.querySelector(".pml-advance-btn").addEventListener("click", () => {
+                window.pywebview.api.pml_advance_patient(p.id).then(() => {
+                    refreshPML();
+                    showToast(`${p.name} advanced`);
+                });
+            });
+
+            const scriptsBtn = card.querySelector(".pml-scripts-btn");
+            const dropdown = card.querySelector(".pml-scripts-dropdown");
+            scriptsBtn.addEventListener("click", () => {
+                if (dropdown.style.display === "none") {
+                    window.pywebview.api.pml_get_patient_scripts(p.id).then((raw) => {
+                        const scripts = JSON.parse(raw);
+                        dropdown.innerHTML = "";
+                        Object.entries(scripts).forEach(([key, desc]) => {
+                            const btn = document.createElement("button");
+                            btn.className = "pml-script-item";
+                            btn.textContent = desc;
+                            btn.addEventListener("click", () => {
+                                window.pywebview.api.pml_get_script_text(p.id, key).then((text) => {
+                                    navigator.clipboard.writeText(text).then(() => {
+                                        showToast("Script copied to clipboard!");
+                                    });
+                                });
+                            });
+                            dropdown.appendChild(btn);
+                        });
+                        dropdown.style.display = "block";
+                    });
+                } else {
+                    dropdown.style.display = "none";
+                }
+            });
+
+            $pmlPatients.appendChild(card);
+        });
+    });
+}
+
+// --- MCP panel ---
+
+const MCP_CATALOG = [
+    {
+        id: "github",
+        name: "GitHub",
+        description: "Search repos, read issues, create PRs",
+        icon: "GH",
+        command: "npx",
+        args: ["-y", "@modelcontextprotocol/server-github"],
+        envKeys: [{ key: "GITHUB_PERSONAL_ACCESS_TOKEN", label: "Personal Access Token", placeholder: "ghp_..." }],
+    },
+    {
+        id: "filesystem",
+        name: "Filesystem",
+        description: "Secure read/write access to specific folders",
+        icon: "FS",
+        command: "npx",
+        args: ["-y", "@modelcontextprotocol/server-filesystem"],
+        extraArgs: true,
+        extraArgsLabel: "Allowed directories (comma-separated)",
+        extraArgsPlaceholder: "/Users/you/Documents, /Users/you/Projects",
+        envKeys: [],
+    },
+    {
+        id: "brave-search",
+        name: "Brave Search",
+        description: "Web search via Brave Search API",
+        icon: "BS",
+        command: "npx",
+        args: ["-y", "@modelcontextprotocol/server-brave-search"],
+        envKeys: [{ key: "BRAVE_API_KEY", label: "API Key", placeholder: "BSA..." }],
+    },
+    {
+        id: "google-maps",
+        name: "Google Maps",
+        description: "Geocoding, directions, place search",
+        icon: "GM",
+        command: "npx",
+        args: ["-y", "@modelcontextprotocol/server-google-maps"],
+        envKeys: [{ key: "GOOGLE_MAPS_API_KEY", label: "API Key", placeholder: "AIza..." }],
+    },
+    {
+        id: "slack",
+        name: "Slack",
+        description: "Read channels, send messages, search",
+        icon: "SL",
+        command: "npx",
+        args: ["-y", "@modelcontextprotocol/server-slack"],
+        envKeys: [
+            { key: "SLACK_BOT_TOKEN", label: "Bot Token", placeholder: "xoxb-..." },
+            { key: "SLACK_TEAM_ID", label: "Team ID", placeholder: "T0..." },
+        ],
+    },
+    {
+        id: "postgres",
+        name: "PostgreSQL",
+        description: "Query and manage PostgreSQL databases",
+        icon: "PG",
+        command: "npx",
+        args: ["-y", "@modelcontextprotocol/server-postgres"],
+        envKeys: [{ key: "POSTGRES_CONNECTION_STRING", label: "Connection String", placeholder: "postgresql://user:pass@host/db" }],
+    },
+];
+
+const $mcpActive = document.getElementById("mcp-active");
+const $mcpCatalog = document.getElementById("mcp-catalog");
+
+function refreshMCP() {
+    window.pywebview.api.get_mcp_status().then((raw) => {
+        const status = JSON.parse(raw);
+        const connectedNames = new Set(Object.keys(status));
+
+        // Render active connections
+        $mcpActive.innerHTML = "";
+        connectedNames.forEach((name) => {
+            const s = status[name];
+            const catalogEntry = MCP_CATALOG.find((c) => c.id === name);
+            const displayName = catalogEntry ? catalogEntry.name : name;
+            const icon = catalogEntry ? catalogEntry.icon : name.slice(0, 2).toUpperCase();
+            const dot = s.connected ? "mcp-dot-on" : "mcp-dot-off";
+            const toolCount = s.tools.length;
+
+            const item = document.createElement("div");
+            item.className = "mcp-active-item";
+            item.innerHTML = `
+                <div class="mcp-active-icon">${escapeHtml(icon)}</div>
+                <div class="mcp-active-info">
+                    <div class="mcp-active-name">
+                        <span class="${dot}"></span>
+                        ${escapeHtml(displayName)}
+                    </div>
+                    <div class="mcp-active-tools">${toolCount} tool${toolCount !== 1 ? "s" : ""} available</div>
+                </div>
+                <button class="mcp-remove-btn" title="Disconnect">&times;</button>
+            `;
+            item.querySelector(".mcp-remove-btn").addEventListener("click", () => {
+                window.pywebview.api.remove_mcp_server(name).then(() => {
+                    refreshMCP();
+                    showToast(`${displayName} disconnected`);
+                });
+            });
+            $mcpActive.appendChild(item);
+        });
+
+        // Render catalog (only show unconnected)
+        $mcpCatalog.innerHTML = "";
+        MCP_CATALOG.forEach((entry) => {
+            if (connectedNames.has(entry.id)) return;
+
+            const card = document.createElement("div");
+            card.className = "mcp-catalog-card";
+            card.innerHTML = `
+                <div class="mcp-catalog-icon">${entry.icon}</div>
+                <div class="mcp-catalog-info">
+                    <div class="mcp-catalog-name">${escapeHtml(entry.name)}</div>
+                    <div class="mcp-catalog-desc">${escapeHtml(entry.description)}</div>
+                </div>
+            `;
+            card.addEventListener("click", () => showConnectorSetup(entry));
+            $mcpCatalog.appendChild(card);
+        });
+    });
+}
+
+function showConnectorSetup(entry) {
+    // Replace catalog with setup form
+    $mcpCatalog.innerHTML = "";
+    const form = document.createElement("div");
+    form.className = "mcp-setup-form";
+
+    let fieldsHtml = "";
+    entry.envKeys.forEach((ek) => {
+        fieldsHtml += `
+            <label class="mcp-setup-label">${escapeHtml(ek.label)}</label>
+            <input class="mcp-setup-input" data-env-key="${ek.key}" type="password"
+                   placeholder="${escapeHtml(ek.placeholder)}" />
+        `;
+    });
+    if (entry.extraArgs) {
+        fieldsHtml += `
+            <label class="mcp-setup-label">${escapeHtml(entry.extraArgsLabel)}</label>
+            <input class="mcp-setup-input" id="mcp-extra-args"
+                   placeholder="${escapeHtml(entry.extraArgsPlaceholder)}" />
+        `;
+    }
+
+    form.innerHTML = `
+        <div class="mcp-setup-header">
+            <div class="mcp-catalog-icon">${entry.icon}</div>
+            <div>
+                <div class="mcp-catalog-name">${escapeHtml(entry.name)}</div>
+                <div class="mcp-catalog-desc">${escapeHtml(entry.description)}</div>
+            </div>
+        </div>
+        ${fieldsHtml}
+        <div class="mcp-setup-buttons">
+            <button class="mcp-setup-cancel">Cancel</button>
+            <button class="mcp-setup-connect">Connect</button>
+        </div>
+    `;
+
+    form.querySelector(".mcp-setup-cancel").addEventListener("click", () => refreshMCP());
+    form.querySelector(".mcp-setup-connect").addEventListener("click", () => {
+        const env = {};
+        form.querySelectorAll("[data-env-key]").forEach((input) => {
+            const val = input.value.trim();
+            if (val) env[input.dataset.envKey] = val;
+        });
+
+        let args = [...entry.args];
+        if (entry.extraArgs) {
+            const extra = (form.querySelector("#mcp-extra-args")?.value || "").trim();
+            if (extra) {
+                args = args.concat(extra.split(",").map((s) => s.trim()).filter(Boolean));
+            }
+        }
+
+        const connectBtn = form.querySelector(".mcp-setup-connect");
+        connectBtn.textContent = "Connecting...";
+        connectBtn.disabled = true;
+
+        window.pywebview.api
+            .add_mcp_server(entry.id, entry.command, JSON.stringify(args), JSON.stringify(env))
+            .then((raw) => {
+                const result = JSON.parse(raw);
+                if (result.ok) {
+                    showToast(`${entry.name} connected!`);
+                } else {
+                    showToast("Error: " + (result.error || "Failed to connect"));
+                }
+                refreshMCP();
+            });
+    });
+
+    $mcpCatalog.appendChild(form);
+}
+
+// --- Skills panel ---
+
+const STATUS_LABEL = {
+    ready: "Ready",
+    disabled: "Disabled",
+    missing_bin: "Missing binary",
+    missing_env: "Missing env var",
+    missing_python: "Missing package",
+    load_error: "Load error",
+};
+
+function refreshSkills() {
+    window.pywebview.api.get_skills_status().then((raw) => {
+        const skills = JSON.parse(raw);
+        $skillsList.innerHTML = "";
+        if (skills.length === 0) {
+            $skillsList.innerHTML = '<div class="skills-empty">No skills installed.</div>';
+            return;
+        }
+        skills.forEach((s) => {
+            const row = document.createElement("div");
+            row.className = "skill-row";
+            const dotClass = s.status === "ready" ? "skill-dot-on" : "skill-dot-off";
+            const icon = s.emoji || s.name.slice(0, 2).toUpperCase();
+            const statusText = STATUS_LABEL[s.status] || s.status;
+            const detail = s.status_detail ? ` — ${escapeHtml(s.status_detail)}` : "";
+            const enabled = s.enabled ? "checked" : "";
+            const pinned = s.pinned ? "checked" : "";
+
+            let authBlock = "";
+            if (s.auth_kind === "oauth" && s.auth) {
+                if (!s.auth.configured) {
+                    authBlock = `<div class="skill-auth-msg">Not configured — drop OAuth client JSON at data/google_oauth.json</div>`;
+                } else if (s.auth.authed) {
+                    authBlock = `
+                        <div class="skill-auth-row">
+                            <span class="skill-auth-status skill-auth-ok">Connected${s.auth.email ? " · " + escapeHtml(s.auth.email) : ""}</span>
+                            <button class="skill-auth-btn skill-auth-disconnect">Disconnect</button>
+                        </div>`;
+                } else {
+                    authBlock = `
+                        <div class="skill-auth-row">
+                            <span class="skill-auth-status skill-auth-off">Not connected</span>
+                            <button class="skill-auth-btn skill-auth-connect">Connect</button>
+                        </div>`;
+                }
+            }
+
+            row.innerHTML = `
+                <div class="skill-head">
+                    <div class="skill-icon">${escapeHtml(icon)}</div>
+                    <div class="skill-info">
+                        <div class="skill-name">
+                            <span class="${dotClass}"></span>
+                            ${escapeHtml(s.name)}
+                        </div>
+                        <div class="skill-desc">${escapeHtml(s.description || "")}</div>
+                        <div class="skill-status">${escapeHtml(statusText)}${detail} · ${s.tool_count} tool${s.tool_count !== 1 ? "s" : ""}</div>
+                    </div>
+                </div>
+                ${authBlock}
+                <div class="skill-controls">
+                    <label><input type="checkbox" class="skill-enable" ${enabled}/> Enabled</label>
+                    <label><input type="checkbox" class="skill-pin" ${pinned}/> Pin to new chats</label>
+                </div>
+            `;
+
+            row.querySelector(".skill-enable").addEventListener("change", (e) => {
+                window.pywebview.api.toggle_skill(s.name, e.target.checked).then(refreshSkills);
+            });
+            row.querySelector(".skill-pin").addEventListener("change", (e) => {
+                window.pywebview.api.toggle_skill_pin(s.name, e.target.checked).then(refreshSkills);
+            });
+
+            const connectBtn = row.querySelector(".skill-auth-connect");
+            if (connectBtn) {
+                connectBtn.addEventListener("click", () => {
+                    connectBtn.textContent = "Opening browser…";
+                    connectBtn.disabled = true;
+                    window.pywebview.api.gmail_connect();
+                    // Completion comes via window.onGmailAuthResult
+                });
+            }
+            const disconnectBtn = row.querySelector(".skill-auth-disconnect");
+            if (disconnectBtn) {
+                disconnectBtn.addEventListener("click", () => {
+                    if (!confirm("Disconnect Gmail? Stored tokens will be deleted.")) return;
+                    window.pywebview.api.gmail_disconnect().then(() => {
+                        showToast("Gmail disconnected");
+                        refreshSkills();
+                    });
+                });
+            }
+
+            $skillsList.appendChild(row);
+        });
+    });
+}
+
+window.onGmailAuthResult = function (result) {
+    if (result && result.ok) {
+        showToast("Gmail connected" + (result.email ? `: ${result.email}` : ""));
+    } else {
+        showToast("Gmail auth failed: " + (result && result.error ? result.error : "unknown"));
+    }
+    refreshSkills();
+};
 
 // --- Chat history ---
 

@@ -36,6 +36,28 @@
                     <span id="header-title">Gemma Chat</span>
                 </div>
                 <div id="header-right">
+                <button id="pml-btn" title="PML Dashboard">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/>
+                        <rect x="8" y="2" width="8" height="4" rx="1" ry="1"/>
+                    </svg>
+                    <span>PML</span>
+                </button>
+                <button id="mcp-btn" title="MCP Servers">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <rect x="2" y="2" width="20" height="8" rx="2" ry="2"/>
+                        <rect x="2" y="14" width="20" height="8" rx="2" ry="2"/>
+                        <line x1="6" y1="6" x2="6.01" y2="6"/>
+                        <line x1="6" y1="18" x2="6.01" y2="18"/>
+                    </svg>
+                    <span>MCP</span>
+                </button>
+                <button id="skills-btn" title="Skills">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <polygon points="12 2 15 8 22 9 17 14 18 21 12 18 6 21 7 14 2 9 9 8 12 2"/>
+                    </svg>
+                    <span>Skills</span>
+                </button>
                 <button id="project-btn" title="Set project folder">
                     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                         <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
@@ -73,7 +95,13 @@
                     </svg>
                     <span>Think</span>
                 </button>
+                <button id="upload-btn" title="Upload file">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
+                    </svg>
+                </button>
                 <div id="input-wrapper">
+                    <div id="attachment-preview" style="display:none"></div>
                     <textarea id="input" rows="1" placeholder="Ask Gemma to do something..." autofocus></textarea>
                 </div>
                 <button id="send-btn" title="Send message">
@@ -89,6 +117,70 @@
             </div>
             <div id="status-bar">
                 <span id="status-text"></span>
+            </div>
+
+            <!-- PML Dashboard Panel -->
+            <div id="pml-panel">
+                <div class="schedule-panel-header">
+                    <h3>PML Dashboard</h3>
+                    <button id="pml-close">&times;</button>
+                </div>
+                <div id="pml-pipeline"></div>
+                <div id="pml-patients"></div>
+                <div id="pml-add-form" style="display:none">
+                    <div class="pml-form-title">New PML Patient</div>
+                    <input id="pml-f-name" placeholder="Patient full name" />
+                    <input id="pml-f-clinician" placeholder="Clinician" value="Dr. Al-Katib" />
+                    <input id="pml-f-weeks" type="number" placeholder="Weeks" value="4" />
+                    <label class="pml-toggle-label">
+                        <input id="pml-f-has-therapist" type="checkbox" />
+                        Has existing therapist
+                    </label>
+                    <div id="pml-therapist-fields" style="display:none">
+                        <input id="pml-f-therapist-name" placeholder="Therapist name" />
+                        <input id="pml-f-therapist-contact" placeholder="Therapist contact" />
+                    </div>
+                    <div class="pml-form-actions">
+                        <button id="pml-add-cancel">Cancel</button>
+                        <button id="pml-add-submit">Create & Generate Scripts</button>
+                    </div>
+                </div>
+                <button id="pml-add-btn">+ New PML Patient</button>
+            </div>
+
+            <!-- MCP Panel -->
+            <div id="mcp-panel">
+                <div class="schedule-panel-header">
+                    <h3>Connectors</h3>
+                    <button id="mcp-close">&times;</button>
+                </div>
+                <div id="mcp-content">
+                    <div id="mcp-active"></div>
+                    <div class="mcp-section-label">Add a connector</div>
+                    <div id="mcp-catalog"></div>
+                    <details class="mcp-advanced">
+                        <summary>Custom server</summary>
+                        <div class="mcp-add-section">
+                            <input id="mcp-name" placeholder="Name" />
+                            <input id="mcp-command" placeholder="Command (e.g. npx)" />
+                            <input id="mcp-args" placeholder='Args (e.g. ["-y","pkg"])' />
+                            <input id="mcp-env" placeholder='Env (e.g. {"KEY":"..."})' />
+                            <button id="mcp-add-btn">Add & Connect</button>
+                        </div>
+                    </details>
+                </div>
+            </div>
+
+            <!-- Skills Panel -->
+            <div id="skills-panel">
+                <div class="schedule-panel-header">
+                    <h3>Skills</h3>
+                    <button id="skills-close">&times;</button>
+                </div>
+                <div id="skills-content">
+                    <div id="skills-list"></div>
+                    <button id="skills-rescan">Rescan</button>
+                </div>
             </div>
 
             <!-- Schedule Panel -->
